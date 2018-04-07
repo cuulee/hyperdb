@@ -71,6 +71,7 @@ function HyperDB (storage, key, opts) {
   this._batchingNodes = null
   this._secretKey = opts.secretKey || null
   this._storeSecretKey = opts.storeSecretKey !== false
+  this._onwrite = opts.onwrite || null
 
   this.ready()
 }
@@ -434,11 +435,12 @@ HyperDB.prototype._writer = function (dir, key, opts) {
   var writer = key && this._byKey.get(key.toString('hex'))
   if (writer) return writer
 
-  var self = this
   opts = Object.assign({}, opts, {
-    sparse: this.sparse
+    sparse: this.sparse,
+    onwrite: this._onwrite ? onwrite : null
   })
 
+  var self = this
   var feed = hypercore(storage, key, opts)
 
   writer = new Writer(self, feed)
@@ -449,6 +451,24 @@ HyperDB.prototype._writer = function (dir, key, opts) {
   else feed.ready(addWriter)
 
   return writer
+
+  function onwrite (index, data, peer, cb) {
+    if (peer) peer.maxRequests++
+    if (index >= writer._cacheLength) writer._cacheLength = index + 1
+    writer._decode(index, data, function (err, entry) {
+      if (err) return done(cb, peer, err)
+      writer._cache.set(index, entry)
+      self._onwrite(entry, peer, function (err) {
+        writer._cache.delete(index)
+        done(cb, peer, err)
+      })
+    })
+  }
+
+  function done (cb, peer, err) {
+    if (peer) peer.maxRequests--
+    cb(err)
+  }
 
   function onremoteupdate () {
     self.emit('remote-update', feed)
@@ -676,6 +696,8 @@ function Writer (db, feed) {
   this._decodeMap = []
   this._checkout = false
   this._length = 0
+  this._cache = new Map()
+  this._cacheLength = 0
 }
 
 Writer.prototype.append = function (entry, cb) {
@@ -734,27 +756,34 @@ Writer.prototype._maybeUpdateFeeds = function () {
   this._updateFeeds()
 }
 
+Writer.prototype._decode = function (seq, buf, cb) {
+  var val = messages.Entry.decode(buf)
+  val[util.inspect.custom] = inspect
+  val.seq = seq
+  val.path = hash(val.key, true)
+  val.value = val.value && this._db._valueEncoding.decode(val.value)
+
+  if (this._feedsMessage && this._feedsLoaded === val.inflate) {
+    this._maybeUpdateFeeds()
+    val.feed = this._id
+    val.clock = this._mapList(val.clock, this._decodeMap, 0)
+    val.trie = trie.decode(val.trie, this._decodeMap)
+    return cb(null, val, this._id)
+  }
+
+  this._loadFeeds(val, buf, cb)
+}
+
 Writer.prototype.get = function (seq, cb) {
   var self = this
 
+  if ((!this._feed.bitfield || !this._feed.has(seq)) && this._cache.has(seq)) {
+    return process.nextTick(cb, null, this._cache.get(seq), this._id)
+  }
+
   this._feed.get(seq, function (err, val) {
     if (err) return cb(err)
-
-    val = messages.Entry.decode(val)
-    val[util.inspect.custom] = inspect
-    val.seq = seq
-    val.path = hash(val.key, true)
-    val.value = val.value && self._db._valueEncoding.decode(val.value)
-
-    if (self._feedsMessage && self._feedsLoaded === val.inflate) {
-      self._maybeUpdateFeeds()
-      val.feed = self._id
-      val.clock = self._mapList(val.clock, self._decodeMap, 0)
-      val.trie = trie.decode(val.trie, self._decodeMap)
-      return cb(null, val, self._id)
-    }
-
-    self._loadFeeds(val, cb)
+    self._decode(seq, val, cb)
   })
 }
 
@@ -775,10 +804,11 @@ Writer.prototype._mapList = function (list, map, def) {
   return mapped
 }
 
-Writer.prototype._loadFeeds = function (head, cb) {
+Writer.prototype._loadFeeds = function (head, buf, cb) {
   var self = this
 
   if (head.feeds) done(head)
+  else if (head.inflate === head.seq) onfeeds(null, buf)
   else this._feed.get(head.inflate, onfeeds)
 
   function onfeeds (err, buf) {
@@ -871,7 +901,7 @@ Writer.prototype._updateFeeds = function () {
 
 Writer.prototype.length = function () {
   if (this._checkout) return this._length
-  return Math.max(this._feed.length, this._feed.remoteLength)
+  return Math.max(this._cacheLength, Math.max(this._feed.length, this._feed.remoteLength))
 }
 
 function filterHeads (list) {
